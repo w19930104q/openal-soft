@@ -15,8 +15,9 @@ enum class AsyncEnableBits : std::uint8_t {
     SourceState,
     BufferCompleted,
     Disconnected,
+    Reconnected,
 
-    MaxValue = Disconnected
+    MaxValue = Reconnected
 };
 
 
@@ -43,6 +44,10 @@ struct AsyncDisconnectEvent {
     std::string msg;
 };
 
+struct AsyncReconnectEvent {
+    std::string msg;
+};
+
 struct AsyncEffectReleaseEvent {
     EffectState *mEffectState;
 };
@@ -51,7 +56,8 @@ using AsyncEvent = std::variant<AsyncKillThread,
     AsyncSourceStateEvent,
     AsyncBufferCompleteEvent,
     AsyncEffectReleaseEvent,
-    AsyncDisconnectEvent>;
+    AsyncDisconnectEvent,
+    AsyncReconnectEvent>;
 
 template<typename T, typename ...Args>
 auto &InitAsyncEvent(AsyncEvent &event, Args&& ...args) noexcept NONBLOCKING

@@ -585,6 +585,11 @@ ALC_API void ALC_APIENTRY alcGetInteger64vSOFT(ALCdevice *device, ALCenum pname,
 #define AL_EVENT_TYPE_BUFFER_COMPLETED_SOFT      0x19A4
 #define AL_EVENT_TYPE_SOURCE_STATE_CHANGED_SOFT  0x19A5
 #define AL_EVENT_TYPE_DISCONNECTED_SOFT          0x19A6
+/* Sent when a previously-disconnected device has automatically recovered and
+ * is usable again (e.g. the playback stream was reopened after the audio
+ * device was reconnected). Context, buffer, and source state is preserved.
+ */
+#define AL_EVENT_TYPE_RECONNECTED_SOFT           0x19A7
 typedef void (AL_APIENTRY*ALEVENTPROCSOFT)(ALenum eventType, ALuint object, ALuint param,
     ALsizei length, const ALchar *message, void *userParam) AL_API_NOEXCEPT17;
 

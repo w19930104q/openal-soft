@@ -138,6 +138,15 @@ auto EventThread(gsl::not_null<al::Context*> const context) -> void
                     context->mEventCb(AL_EVENT_TYPE_DISCONNECTED_SOFT, 0, 0,
                         al::saturating_cast<ALsizei>(evt.msg.size()), evt.msg.c_str(),
                         context->mEventParam);
+                },
+                [context,enabledevts](AsyncReconnectEvent const &evt)
+                {
+                    if(!context->mEventCb || !enabledevts.test(AsyncEnableBits::Reconnected))
+                        return;
+
+                    context->mEventCb(AL_EVENT_TYPE_RECONNECTED_SOFT, 0, 0,
+                        al::saturating_cast<ALsizei>(evt.msg.size()), evt.msg.c_str(),
+                        context->mEventParam);
                 }
             }, event);
         }
@@ -152,6 +161,7 @@ constexpr auto GetEventType(ALenum const etype) noexcept -> std::optional<AsyncE
     {
     case AL_EVENT_TYPE_BUFFER_COMPLETED_SOFT: return AsyncEnableBits::BufferCompleted;
     case AL_EVENT_TYPE_DISCONNECTED_SOFT: return AsyncEnableBits::Disconnected;
+    case AL_EVENT_TYPE_RECONNECTED_SOFT: return AsyncEnableBits::Reconnected;
     case AL_EVENT_TYPE_SOURCE_STATE_CHANGED_SOFT: return AsyncEnableBits::SourceState;
     }
     return std::nullopt;

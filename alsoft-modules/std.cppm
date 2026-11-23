@@ -4,6 +4,7 @@ module;
 #include <array>
 #include <cmath>
 #include <compare>
+#include <condition_variable>
 #include <exception>
 #include <fstream>
 #include <ios>
@@ -402,6 +403,12 @@ export namespace std {
     using std::try_lock;
     using std::lock;
     using std::call_once;
+
+    /* condition_variable */
+    using std::condition_variable;
+    using std::condition_variable_any;
+    using std::cv_status;
+    using std::notify_all_at_thread_exit;
     using std::defer_lock;
     using std::try_to_lock;
     using std::adopt_lock;

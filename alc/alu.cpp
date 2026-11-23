@@ -2591,3 +2591,24 @@ void DeviceBase::doDisconnect(al::string_view const fmt, al::format_args&& args)
         }
     }
 }
+
+void DeviceBase::doReconnect(al::string_view const fmt, al::format_args&& args)
+{
+    const auto mixLock = getWriteMixLock();
+
+    if(!Connected.exchange(true, std::memory_order_acq_rel))
+    {
+        auto const evt = std::array{AsyncEvent{std::in_place_type<AsyncReconnectEvent>,
+            al::vformat(fmt, std::move(args))}};
+
+        for(auto *ctx : *mContexts.load())
+        {
+            if(auto *const ring = ctx->mAsyncEvents.get();
+                ring->write(evt) > 0)
+            {
+                ctx->mEventsPending.store(1, std::memory_order_release);
+                al::atomic_notify_all(ctx->mEventsPending);
+            }
+        }
+    }
+}

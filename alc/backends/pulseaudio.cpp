@@ -58,9 +58,11 @@ import zudl;
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "alc/backends/base.hpp"
@@ -590,6 +592,19 @@ struct MainloopUniqueLock : public std::unique_lock<PulseMainloop> {
     }
 
     void connectContext();
+    /* Drops the current (failed) context and establishes a new one. */
+    void reconnectContext()
+    {
+        if(mutex()->mContext)
+        {
+            pa_context_set_state_callback(mutex()->mContext, nullptr, nullptr);
+            pa_context_set_subscribe_callback(mutex()->mContext, nullptr, nullptr);
+            pa_context_disconnect(mutex()->mContext);
+            pa_context_unref(mutex()->mContext);
+            mutex()->mContext = nullptr;
+        }
+        connectContext();
+    }
     auto connectStream(gsl::czstring device_name, pa_stream_flags_t flags, pa_buffer_attr *attr,
         pa_sample_spec *spec, pa_channel_map *chanmap, BackendType type) -> pa_stream*;
 
@@ -718,17 +733,34 @@ struct PulsePlayback final : BackendBase {
     ~PulsePlayback() override;
 
     void bufferAttrCallback(pa_stream *stream) noexcept;
-    void streamStateCallback(pa_stream *stream) const noexcept;
+    void streamStateCallback(pa_stream *stream) noexcept;
     void streamWriteCallback(pa_stream *stream, size_t nbytes) const noexcept;
     void sinkInfoCallback(pa_context *context, const pa_sink_info *info, int eol) noexcept;
     void sinkNameCallback(pa_context *context, const pa_sink_info *info, int eol) noexcept;
     void streamMovedCallback(pa_stream *stream) noexcept;
+    void deviceEventCallback(pa_subscription_event_type_t type, uint32_t idx) noexcept;
 
     void open(std::string_view name) override;
     auto reset() -> bool override;
     void start() override;
     void stop() override;
     auto getClockLatency() -> ClockLatency override;
+
+    /* Stream (re)creation with the current device format. The mainloop must
+     * be locked.
+     */
+    void disconnectStream() noexcept;
+    void setupStream(MainloopUniqueLock &plock);
+    void startLocked(MainloopUniqueLock &plock);
+    void subscribeDeviceEvents(MainloopUniqueLock &plock);
+
+    /* Automatic stream recovery after the device disconnects (e.g. USB
+     * hot-plug). A background thread waits for the sink to reappear and
+     * reopens the stream, keeping the ALCdevice state intact.
+     */
+    void requestReconnect() noexcept;
+    void recoveryThreadFunc() noexcept;
+    auto tryRecover() -> bool;
 
     PulseMainloop mMainloop;
 
@@ -741,10 +773,26 @@ struct PulsePlayback final : BackendBase {
     pa_stream *mStream{nullptr};
 
     unsigned mFrameSize{0u};
+
+    std::thread mRecoveryThread;
+    std::mutex mRecoveryMutex;
+    std::condition_variable mRecoveryCond;
+    bool mRecoveryQuit{false};
+    bool mReconnectPending{false};
 };
 
 PulsePlayback::~PulsePlayback()
-{ if(mStream) mMainloop.close(mStream); }
+{
+    {
+        auto const lock = std::lock_guard{mRecoveryMutex};
+        mRecoveryQuit = true;
+    }
+    mRecoveryCond.notify_one();
+    if(mRecoveryThread.joinable())
+        mRecoveryThread.join();
+
+    if(mStream) mMainloop.close(mStream);
+}
 
 
 void PulsePlayback::bufferAttrCallback(pa_stream *const stream) noexcept
@@ -758,14 +806,91 @@ void PulsePlayback::bufferAttrCallback(pa_stream *const stream) noexcept
     TRACE("minreq={}, tlength={}, prebuf={}", mAttr.minreq, mAttr.tlength, mAttr.prebuf);
 }
 
-void PulsePlayback::streamStateCallback(pa_stream *const stream) const noexcept
+void PulsePlayback::streamStateCallback(pa_stream *const stream) noexcept
 {
     if(pa_stream_get_state(stream) == PA_STREAM_FAILED)
     {
         ERR("Received stream failure!");
         mDevice.handleDisconnect("Playback stream failure");
+        requestReconnect();
     }
     mMainloop.signal();
+}
+
+void PulsePlayback::deviceEventCallback(pa_subscription_event_type_t const type, uint32_t) noexcept
+{
+    const auto facility = (type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK);
+    if(facility != PA_SUBSCRIPTION_EVENT_SINK && facility != PA_SUBSCRIPTION_EVENT_SERVER)
+        return;
+
+    /* A sink or server change while disconnected likely means the device is
+     * back (or a new default appeared); nudge the recovery thread.
+     */
+    if(!mDevice.Connected.load(std::memory_order_acquire))
+        requestReconnect();
+}
+
+void PulsePlayback::requestReconnect() noexcept
+{
+    {
+        auto const lock = std::lock_guard{mRecoveryMutex};
+        mReconnectPending = true;
+    }
+    mRecoveryCond.notify_one();
+}
+
+void PulsePlayback::recoveryThreadFunc() noexcept
+{
+    auto lock = std::unique_lock{mRecoveryMutex};
+    while(!mRecoveryQuit)
+    {
+        /* Wake up on explicit requests, or periodically to re-check the
+         * connection state (a failed reset() from the app can clear the
+         * connected flag without going through the stream callbacks).
+         */
+        mRecoveryCond.wait_for(lock, std::chrono::milliseconds{500},
+            [this]{ return mRecoveryQuit || mReconnectPending; });
+        mReconnectPending = false;
+        if(mRecoveryQuit)
+            break;
+        if(mDevice.Connected.load(std::memory_order_acquire))
+            continue;
+
+        lock.unlock();
+        tryRecover();
+        lock.lock();
+    }
+}
+
+auto PulsePlayback::tryRecover() -> bool
+{
+    TRACE("Attempting playback stream recovery");
+    try {
+        auto plock = MainloopUniqueLock{mMainloop};
+
+        auto *context = mMainloop.getContext();
+        if(!context || !PA_CONTEXT_IS_GOOD(pa_context_get_state(context)))
+        {
+            plock.reconnectContext();
+            subscribeDeviceEvents(plock);
+        }
+        else if(pa_context_get_state(context) != PA_CONTEXT_READY)
+            return false;
+
+        disconnectStream();
+        setupStream(plock);
+
+        if(mDevice.mDeviceState == DeviceState::Playing)
+            startLocked(plock);
+    }
+    catch(std::exception &e) {
+        WARN("Playback recovery attempt failed: {}", e.what());
+        return false;
+    }
+
+    TRACE("Playback stream recovered");
+    mDevice.handleReconnect("Playback stream recovered");
+    return true;
 }
 
 void PulsePlayback::streamWriteCallback(pa_stream *const stream, size_t nbytes) const noexcept
@@ -919,6 +1044,42 @@ void PulsePlayback::open(std::string_view name)
             pa_stream_get_device_name(mStream), name_callback, this);
         plock.waitForOperation(op);
     }
+
+    /* Watch for sink/server changes to detect the device coming back after
+     * a disconnect.
+     */
+    subscribeDeviceEvents(plock);
+
+    if(!mRecoveryThread.joinable())
+        mRecoveryThread = std::thread{[this]{ recoveryThreadFunc(); }};
+}
+
+void PulsePlayback::subscribeDeviceEvents(MainloopUniqueLock &plock)
+{
+    static constexpr auto submask = PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SERVER;
+    static constexpr auto do_signal = [](pa_context*, int, void *pdata) noexcept
+    { static_cast<PulseMainloop*>(pdata)->signal(); };
+    auto *op = pa_context_subscribe(mMainloop.getContext(), submask, do_signal, &mMainloop);
+    plock.waitForOperation(op);
+
+    static constexpr auto handler = [](pa_context*, pa_subscription_event_type_t const t,
+        uint32_t const idx, void *const pdata) noexcept
+    { static_cast<PulsePlayback*>(pdata)->deviceEventCallback(t, idx); };
+    pa_context_set_subscribe_callback(mMainloop.getContext(), handler, this);
+}
+
+void PulsePlayback::disconnectStream() noexcept
+{
+    if(!mStream)
+        return;
+
+    pa_stream_set_state_callback(mStream, nullptr, nullptr);
+    pa_stream_set_moved_callback(mStream, nullptr, nullptr);
+    pa_stream_set_write_callback(mStream, nullptr, nullptr);
+    pa_stream_set_buffer_attr_callback(mStream, nullptr, nullptr);
+    pa_stream_disconnect(mStream);
+    pa_stream_unref(mStream);
+    mStream = nullptr;
 }
 
 auto PulsePlayback::reset() -> bool
@@ -926,22 +1087,21 @@ auto PulsePlayback::reset() -> bool
     auto plock = MainloopUniqueLock{mMainloop};
     const auto deviceName = mDeviceId ? mDeviceId->c_str() : nullptr;
 
-    if(mStream)
-    {
-        pa_stream_set_state_callback(mStream, nullptr, nullptr);
-        pa_stream_set_moved_callback(mStream, nullptr, nullptr);
-        pa_stream_set_write_callback(mStream, nullptr, nullptr);
-        pa_stream_set_buffer_attr_callback(mStream, nullptr, nullptr);
-        pa_stream_disconnect(mStream);
-        pa_stream_unref(mStream);
-        mStream = nullptr;
-    }
+    disconnectStream();
 
     static constexpr auto info_cb = [](pa_context *const context, pa_sink_info const *const info,
         int const eol, void *const pdata) noexcept
     { return static_cast<PulsePlayback*>(pdata)->sinkInfoCallback(context, info, eol); };
     auto *op = pa_context_get_sink_info_by_name(mMainloop.getContext(), deviceName, info_cb, this);
     plock.waitForOperation(op);
+
+    setupStream(plock);
+    return true;
+}
+
+void PulsePlayback::setupStream(MainloopUniqueLock &plock)
+{
+    const auto deviceName = mDeviceId ? mDeviceId->c_str() : nullptr;
 
     auto flags = PA_STREAM_START_CORKED | PA_STREAM_INTERPOLATE_TIMING
         | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_EARLY_REQUESTS;
@@ -1060,8 +1220,8 @@ auto PulsePlayback::reset() -> bool
         mAttr.prebuf = 0u;
         mAttr.minreq = gsl::narrow_cast<unsigned>(perlen) * mFrameSize;
 
-        op = pa_stream_set_buffer_attr(mStream, &mAttr, &PulseMainloop::streamSuccessCallbackC,
-            &mMainloop);
+        auto *op = pa_stream_set_buffer_attr(mStream, &mAttr,
+            &PulseMainloop::streamSuccessCallbackC, &mMainloop);
         plock.waitForOperation(op);
 
         mDevice.mSampleRate = mSpec.rate;
@@ -1074,14 +1234,18 @@ auto PulsePlayback::reset() -> bool
 
     mDevice.mBufferSize = mAttr.tlength / mFrameSize;
     mDevice.mUpdateSize = mAttr.minreq / mFrameSize;
-
-    return true;
 }
 
 void PulsePlayback::start()
 {
     auto plock = MainloopUniqueLock{mMainloop};
+    if(!mStream)
+        return;
+    startLocked(plock);
+}
 
+void PulsePlayback::startLocked(MainloopUniqueLock &plock)
+{
     /* Write some samples to fill the buffer before we start feeding it newly
      * mixed samples.
      */
@@ -1105,6 +1269,8 @@ void PulsePlayback::start()
 void PulsePlayback::stop()
 {
     auto const plock = MainloopUniqueLock{mMainloop};
+    if(!mStream)
+        return;
 
     auto *const op = pa_stream_cork(mStream, 1, &PulseMainloop::streamSuccessCallbackC,
         &mMainloop);
@@ -1124,7 +1290,10 @@ auto PulsePlayback::getClockLatency() -> ClockLatency
     {
         auto plock = MainloopUniqueLock{mMainloop};
         ret.ClockTime = mDevice.getClockTime();
-        err = pa_stream_get_latency(mStream, &latency, &neg);
+        if(!mStream)
+            err = -PA_ERR_NODATA;
+        else
+            err = pa_stream_get_latency(mStream, &latency, &neg);
     }
 
     if(err != 0) [[unlikely]]
@@ -1150,9 +1319,10 @@ struct PulseCapture final : BackendBase {
     using BackendBase::BackendBase;
     ~PulseCapture() override;
 
-    void streamStateCallback(pa_stream *stream) const noexcept;
+    void streamStateCallback(pa_stream *stream) noexcept;
     void sourceNameCallback(pa_context *context, const pa_source_info *info, int eol) noexcept;
     void streamMovedCallback(pa_stream *stream) noexcept;
+    void deviceEventCallback(pa_subscription_event_type_t type, uint32_t idx) noexcept;
 
     void open(std::string_view name) override;
     void start() override;
@@ -1160,6 +1330,20 @@ struct PulseCapture final : BackendBase {
     void captureSamples(std::span<std::byte> outbuffer) override;
     auto availableSamples() -> std::size_t override;
     auto getClockLatency() -> ClockLatency override;
+
+    /* Stream (re)creation with the current device format. The mainloop must
+     * be locked.
+     */
+    void disconnectStream() noexcept;
+    void setupStream(MainloopUniqueLock &plock);
+    void subscribeDeviceEvents(MainloopUniqueLock &plock);
+
+    /* Automatic stream recovery after the device disconnects (e.g. USB
+     * hot-plug).
+     */
+    void requestReconnect() noexcept;
+    void recoveryThreadFunc() noexcept;
+    auto tryRecover() -> bool;
 
     PulseMainloop mMainloop;
 
@@ -1176,20 +1360,115 @@ struct PulseCapture final : BackendBase {
     pa_sample_spec mSpec{};
 
     pa_stream *mStream{nullptr};
+
+    std::thread mRecoveryThread;
+    std::mutex mRecoveryMutex;
+    std::condition_variable mRecoveryCond;
+    bool mRecoveryQuit{false};
+    bool mReconnectPending{false};
 };
 
 PulseCapture::~PulseCapture()
-{ if(mStream) mMainloop.close(mStream); }
+{
+    {
+        auto const lock = std::lock_guard{mRecoveryMutex};
+        mRecoveryQuit = true;
+    }
+    mRecoveryCond.notify_one();
+    if(mRecoveryThread.joinable())
+        mRecoveryThread.join();
+
+    if(mStream) mMainloop.close(mStream);
+}
 
 
-void PulseCapture::streamStateCallback(pa_stream *const stream) const noexcept
+void PulseCapture::streamStateCallback(pa_stream *const stream) noexcept
 {
     if(pa_stream_get_state(stream) == PA_STREAM_FAILED)
     {
         ERR("Received stream failure!");
         mDevice.handleDisconnect("Capture stream failure");
+        requestReconnect();
     }
     mMainloop.signal();
+}
+
+void PulseCapture::deviceEventCallback(pa_subscription_event_type_t const type, uint32_t) noexcept
+{
+    const auto facility = (type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK);
+    if(facility != PA_SUBSCRIPTION_EVENT_SOURCE && facility != PA_SUBSCRIPTION_EVENT_SERVER)
+        return;
+
+    if(!mDevice.Connected.load(std::memory_order_acquire))
+        requestReconnect();
+}
+
+void PulseCapture::requestReconnect() noexcept
+{
+    {
+        auto const lock = std::lock_guard{mRecoveryMutex};
+        mReconnectPending = true;
+    }
+    mRecoveryCond.notify_one();
+}
+
+void PulseCapture::recoveryThreadFunc() noexcept
+{
+    auto lock = std::unique_lock{mRecoveryMutex};
+    while(!mRecoveryQuit)
+    {
+        mRecoveryCond.wait_for(lock, std::chrono::milliseconds{500},
+            [this]{ return mRecoveryQuit || mReconnectPending; });
+        mReconnectPending = false;
+        if(mRecoveryQuit)
+            break;
+        if(mDevice.Connected.load(std::memory_order_acquire))
+            continue;
+
+        lock.unlock();
+        tryRecover();
+        lock.lock();
+    }
+}
+
+auto PulseCapture::tryRecover() -> bool
+{
+    TRACE("Attempting capture stream recovery");
+    try {
+        auto plock = MainloopUniqueLock{mMainloop};
+
+        auto *context = mMainloop.getContext();
+        if(!context || !PA_CONTEXT_IS_GOOD(pa_context_get_state(context)))
+        {
+            plock.reconnectContext();
+            subscribeDeviceEvents(plock);
+        }
+        else if(pa_context_get_state(context) != PA_CONTEXT_READY)
+            return false;
+
+        disconnectStream();
+        setupStream(plock);
+
+        /* Drop any stale packet references from the old stream. */
+        mCapBuffer = {};
+        mHoleLength = 0;
+        mPacketLength = 0;
+
+        if(mDevice.mDeviceState == DeviceState::Playing)
+        {
+            auto *op = pa_stream_cork(mStream, 0, &PulseMainloop::streamSuccessCallbackC,
+                &mMainloop);
+            plock.waitForOperation(op);
+        }
+    }
+    catch(std::exception &e) {
+        WARN("Capture recovery attempt failed: {}", e.what());
+        return false;
+    }
+
+    TRACE("Capture stream recovered");
+    mDevice.handleReconnect("Capture stream recovered");
+    return true;
 }
 
 void PulseCapture::sourceNameCallback(pa_context*, const pa_source_info *info, int eol) noexcept
@@ -1237,6 +1516,60 @@ void PulseCapture::open(std::string_view name)
 
     auto plock = MainloopUniqueLock{mMainloop};
     plock.connectContext();
+
+    if(!pulse_name.empty())
+        mDeviceId.emplace(std::move(pulse_name));
+
+    setupStream(plock);
+
+    if(mDeviceName.empty())
+    {
+        static constexpr auto name_callback = [](pa_context *const context,
+            pa_source_info const *const info, int const eol, void *const pdata) noexcept
+        { return static_cast<PulseCapture*>(pdata)->sourceNameCallback(context, info, eol); };
+        auto *op = pa_context_get_source_info_by_name(mMainloop.getContext(),
+            pa_stream_get_device_name(mStream), name_callback, this);
+        plock.waitForOperation(op);
+    }
+
+    /* Watch for source/server changes to detect the device coming back after
+     * a disconnect.
+     */
+    subscribeDeviceEvents(plock);
+
+    if(!mRecoveryThread.joinable())
+        mRecoveryThread = std::thread{[this]{ recoveryThreadFunc(); }};
+}
+
+void PulseCapture::subscribeDeviceEvents(MainloopUniqueLock &plock)
+{
+    static constexpr auto submask = PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER;
+    static constexpr auto do_signal = [](pa_context*, int, void *pdata) noexcept
+    { static_cast<PulseMainloop*>(pdata)->signal(); };
+    auto *op = pa_context_subscribe(mMainloop.getContext(), submask, do_signal, &mMainloop);
+    plock.waitForOperation(op);
+
+    static constexpr auto handler = [](pa_context*, pa_subscription_event_type_t const t,
+        uint32_t const idx, void *const pdata) noexcept
+    { static_cast<PulseCapture*>(pdata)->deviceEventCallback(t, idx); };
+    pa_context_set_subscribe_callback(mMainloop.getContext(), handler, this);
+}
+
+void PulseCapture::disconnectStream() noexcept
+{
+    if(!mStream)
+        return;
+
+    pa_stream_set_state_callback(mStream, nullptr, nullptr);
+    pa_stream_set_moved_callback(mStream, nullptr, nullptr);
+    pa_stream_disconnect(mStream);
+    pa_stream_unref(mStream);
+    mStream = nullptr;
+}
+
+void PulseCapture::setupStream(MainloopUniqueLock &plock)
+{
+    const auto deviceName = mDeviceId ? mDeviceId->c_str() : nullptr;
 
     auto chanmap = pa_channel_map{};
     switch(mDevice.FmtChans)
@@ -1294,8 +1627,8 @@ void PulseCapture::open(std::string_view name)
     if(!GetConfigValueBool({}, "pulse", "allow-moves", true))
         flags |= PA_STREAM_DONT_MOVE;
 
-    TRACE("Connecting to \"{}\"", pulse_name.empty() ? "(default)"sv:std::string_view{pulse_name});
-    mStream = plock.connectStream(pulse_name, flags, &mAttr, &mSpec, &chanmap,
+    TRACE("Connecting to \"{}\"", deviceName ? std::string_view{deviceName} : "(default)"sv);
+    mStream = plock.connectStream(deviceName, flags, &mAttr, &mSpec, &chanmap,
         BackendType::Capture);
 
     static constexpr auto move_callback = [](pa_stream *const stream, void *const pdata) noexcept
@@ -1305,24 +1638,13 @@ void PulseCapture::open(std::string_view name)
     static constexpr auto state_callback = [](pa_stream *const stream, void *const pdata) noexcept
     { return static_cast<PulseCapture*>(pdata)->streamStateCallback(stream); };
     pa_stream_set_state_callback(mStream, state_callback, this);
-
-    if(!pulse_name.empty())
-        mDeviceId.emplace(std::move(pulse_name));
-
-    if(mDeviceName.empty())
-    {
-        static constexpr auto name_callback = [](pa_context *const context,
-            pa_source_info const *const info, int const eol, void *const pdata) noexcept
-        { return static_cast<PulseCapture*>(pdata)->sourceNameCallback(context, info, eol); };
-        auto *op = pa_context_get_source_info_by_name(mMainloop.getContext(),
-            pa_stream_get_device_name(mStream), name_callback, this);
-        plock.waitForOperation(op);
-    }
 }
 
 void PulseCapture::start()
 {
     auto const plock = MainloopUniqueLock{mMainloop};
+    if(!mStream)
+        return;
     auto *const op = pa_stream_cork(mStream, 0, &PulseMainloop::streamSuccessCallbackC,
         &mMainloop);
     plock.waitForOperation(op);
@@ -1331,6 +1653,8 @@ void PulseCapture::start()
 void PulseCapture::stop()
 {
     auto const plock = MainloopUniqueLock{mMainloop};
+    if(!mStream)
+        return;
     auto *const op = pa_stream_cork(mStream, 1, &PulseMainloop::streamSuccessCallbackC,
         &mMainloop);
     plock.waitForOperation(op);
@@ -1441,7 +1765,10 @@ auto PulseCapture::getClockLatency() -> ClockLatency
     {
         auto plock = MainloopUniqueLock{mMainloop};
         ret.ClockTime = mDevice.getClockTime();
-        err = pa_stream_get_latency(mStream, &latency, &neg);
+        if(!mStream)
+            err = -PA_ERR_NODATA;
+        else
+            err = pa_stream_get_latency(mStream, &latency, &neg);
     }
 
     if(err != 0) [[unlikely]]

@@ -339,11 +339,19 @@ struct DeviceBase {
     void handleDisconnect(al::format_string<Args...> fmt, Args&& ...args)
     { doDisconnect(fmt.get(), al::make_format_args(args...)); }
 
+    /* Marks the device connected again after an automatic recovery, and
+     * notifies contexts about the reconnection.
+     */
+    template<typename ...Args>
+    void handleReconnect(al::format_string<Args...> fmt, Args&& ...args)
+    { doReconnect(fmt.get(), al::make_format_args(args...)); }
+
 private:
     [[nodiscard]]
     auto renderSamples(unsigned numSamples) noexcept NONBLOCKING -> unsigned;
 
     void doDisconnect(al::string_view fmt, al::format_args&& args);
+    void doReconnect(al::string_view fmt, al::format_args&& args);
 
 protected:
     explicit DeviceBase(DeviceType type);

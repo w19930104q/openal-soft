@@ -3,6 +3,7 @@
 
 #include <concepts>
 #include <istream>
+#include <limits>
 #include <span>
 #include <streambuf>
 
