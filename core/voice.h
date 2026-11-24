@@ -240,6 +240,13 @@ struct Voice {
     TargetData mDirect;
     std::array<TargetData, MaxSendCount> mSend;
 
+    /* Source position in listener (head-relative) coordinates, pre-distance
+     * normalization. Updated each mixer update and used to drive position-
+     * aware effects (e.g. the reverb image-source early reflections) with a
+     * per-source position even after the wet signals are mixed together.
+     */
+    std::array<float,3> mWetPos{};
+
     /* The first MaxResamplerPadding/2 elements are the sample history from the
      * previous mix, with an additional MaxResamplerPadding/2 elements that are
      * now current (which may be overwritten if the buffer data is still

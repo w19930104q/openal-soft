@@ -15,6 +15,7 @@
 #include "async_event.h"
 #include "context.h"
 #include "cpu_caps.h"
+#include "effectslot.h"
 #include "filters/biquad.h"
 #include "filters/nfc.h"
 #include "filters/splitter.h"
@@ -995,6 +996,23 @@ auto DoMix(Voice &voice, Voice::State const vstate, unsigned const numSends, uns
 
             auto const targetGains = (vstate == Voice::Playing) ? std::span{parms.Gains.Target}
                 : std::span{SilentCoeffs}.first<MaxAmbiChannels>();
+
+            /* Accumulate this voice's head-relative position into the target
+             * slot, weighted by the omnidirectional (B-Format W/ACN0) wet
+             * gain, so the slot can derive an energy-weighted source location
+             * for position-aware effects.
+             */
+            if(auto *const slot = voice.mProps.Send[send].Slot; slot != nullptr)
+            {
+                if(auto const wgain = std::fabs(parms.Gains.Target[0]); wgain > GainSilenceThreshold)
+                {
+                    slot->mWetPosAccum[0] += voice.mWetPos[0]*wgain;
+                    slot->mWetPosAccum[1] += voice.mWetPos[1]*wgain;
+                    slot->mWetPosAccum[2] += voice.mWetPos[2]*wgain;
+                    slot->mWetPosWeight += wgain;
+                }
+            }
+
             MixSamples(samples, voice.mSend[send].Buffer, parms.Gains.Current, targetGains, counter,
                 outPos);
         }

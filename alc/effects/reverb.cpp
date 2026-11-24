@@ -27,6 +27,7 @@
 #include <span>
 
 #include "alc/effects/base.h"
+#include "alc/alconfig.h"
 #include "core/bufferline.h"
 #include "core/effects/base.h"
 #include "core/filters/biquad.h"
@@ -102,6 +103,82 @@ constexpr auto NUM_LINES = 4_uz;
  * The value 0.05 seems to be nearest to Creative hardware behavior.
  */
 constexpr auto MODULATION_DEPTH_COEFF = 0.05f;
+
+
+/**************************************
+ *  Image-source early reflections    *
+ **************************************/
+
+/* Speed of sound in air, meters per second (matches the legacy model). */
+constexpr auto SpeedOfSound = 343.3f;
+
+/* Shoebox image-source model: reflection order 1 yields the six first-order
+ * wall images (two per axis); order 2 additionally includes edge/corner
+ * images, 24 in total.
+ */
+constexpr auto IsmMaxOrder = 2u;
+constexpr auto IsmMaxTaps = 24_uz;
+
+/* Minimum room side length in meters, guards against degenerate geometry. */
+constexpr auto IsmMinRoomSize = 0.5f;
+
+/* Average room dimension (meters) the legacy fixed taps are derived for. Used
+ * as the anchor when deriving room geometry from the Density parameter.
+ */
+constexpr auto IsmBaseRoomSize = 5.0f;
+
+/* One image tap: a variable-delay read of the mono input line with its own
+ * gain, high-frequency loss, and arrival direction (head-relative unit
+ * vector). Current/Target pairs are smoothed per update block.
+ */
+struct IsmTap {
+    float Delay{0.0f};
+    float DelayTarget{0.0f};
+    float Gain{0.0f};
+    float GainTarget{0.0f};
+    /* One-pole low-pass state/coefficient for wall+air high-frequency loss. */
+    float LpCoeff{0.0f};
+    float LpCoeffTarget{0.0f};
+    float LpState{0.0f};
+    std::array<float,3> Dir{};
+    std::array<float,3> DirTarget{};
+    /* Output-channel panning gains for each first-order B-Format input
+     * component (ACN 0..3 = W,Y,Z,X). Each B-Format component is mapped onto
+     * the device output channels with its own gain set.
+     */
+    struct OutGains {
+        std::array<std::array<float, MaxAmbiChannels>, NUM_LINES> Current{};
+        std::array<std::array<float, MaxAmbiChannels>, NUM_LINES> Target{};
+
+        void fill(float v) noexcept
+        {
+            for(auto &row : Current) row.fill(v);
+            for(auto &row : Target) row.fill(v);
+        }
+    };
+    OutGains Gains{};
+
+    void clear() noexcept NONBLOCKING
+    {
+        Delay = DelayTarget = Gain = GainTarget = 0.0f;
+        LpCoeff = LpCoeffTarget = LpState = 0.0f;
+        Dir.fill(0.0f);
+        DirTarget.fill(0.0f);
+        IGNORE_FUNCTION_EFFECTS(Gains.fill(0.0f);)
+    }
+};
+
+/* Configuration of the image-source model, loaded once from the [reverb]
+ * config block. When mEnabled is false the legacy fixed-tap model is used.
+ */
+struct IsmConfig {
+    bool mEnabled{false};
+    unsigned int mOrder{1u};
+    bool mExplicitRoom{false};
+    std::array<float,3> mRoomSize{{8.0f, 6.0f, 3.0f}};
+    std::array<float,3> mWallReflect{{0.9f, 0.9f, 0.9f}};
+    float mSmoothing{0.5f};
+};
 
 
 /* The B-Format to (W-normalized) A-Format conversion matrix. This produces a
@@ -554,6 +631,55 @@ struct ReverbPipeline {
 
     std::size_t mFadeSampleCount{1};
 
+    /* Overall output gain for the image-source early reflections (reflection
+     * gain times slot gain), cached at update time for the render path.
+     */
+    float mIsmOutGain{0.0f};
+
+    /* Image-source early-reflection engine. Active only when the [reverb]
+     * image-source config option is enabled. When active, the legacy fixed
+     * early-reflection output is muted (its scatter into the late reverb
+     * input is preserved) and these taps generate the position-aware early
+     * response instead.
+     */
+    struct ImageSourceModel {
+        /* Mono input delay line (channel 0 of a NUM_LINES-strided line). */
+        DelayLineU Delay;
+        std::array<IsmTap, IsmMaxTaps> Taps{};
+        std::size_t TapCount{0};
+        /* Last smoothed head-relative source position, held when no voice
+         * contributes to the slot during an update block.
+         */
+        std::array<float,3> LastPos{};
+        bool HasPosition{false};
+        /* False until the first block with a contributing source. On that
+         * block the tap geometry (delay/filter/direction) is initialized
+         * directly to its target instead of being smoothed in from zero, so
+         * the very first impulse gets the correct reflection delays rather
+         * than a ramp of converging read positions.
+         */
+        bool GeometryInitialized{false};
+        /* Per-tap rendered first-order B-Format (ACN/N3D: W,Y,Z,X) output.
+         * Kept separate per tap so each tap's directional components use their
+         * own output-channel panning gains in the final mix.
+         */
+        alignas(16) std::array<std::array<FloatBufferLine, NUM_LINES>, IsmMaxTaps> TapBf{};
+
+        void clear() noexcept NONBLOCKING
+        {
+            std::ranges::fill(Delay.mLine, 0.0f);
+            IGNORE_FUNCTION_EFFECTS(
+                std::ranges::for_each(Taps, &IsmTap::clear);
+                std::ranges::for_each(TapBf | std::views::join,
+                    [](FloatBufferLine &line){ line.fill(0.0f); });
+            )
+            TapCount = 0;
+            LastPos.fill(0.0f);
+            HasPosition = false;
+            GeometryInitialized = false;
+        }
+    } mIsm;
+
     void updateDelayLine(float gain, float earlyDelay, float lateDelay, float density_mult,
         float frequency);
     void update3DPanning(std::span<float const, 3> ReflectionsPan,
@@ -578,6 +704,7 @@ struct ReverbPipeline {
         mLateDelayTap = {};
         mEarly.clear();
         mLate.clear();
+        mIsm.clear();
         IGNORE_FUNCTION_EFFECTS( /* BandSplitter::clear is non-blocking. */
             std::ranges::for_each(mAmbiSplitter | std::views::join, &BandSplitter::clear);
         )
@@ -615,6 +742,10 @@ struct ReverbState final : EffectState {
     };
     PipelineState mPipelineState{DeviceClear};
     bool mCurrentPipeline{false};
+    /* Total length of the current pipeline cross-fade in samples, used to
+     * ramp the old pipeline's image-source output gain.
+     */
+    std::size_t mFadeSampleTotal{1};
 
     /* Core delay line (early reflections tap from this). */
     DelayLineU mMainDelay;
@@ -634,6 +765,26 @@ struct ReverbState final : EffectState {
     std::array<float, MaxAmbiOrder+1> mOrderScales{};
 
     bool mUpmixOutput{false};
+
+    /* Image-source model configuration, loaded on device update. */
+    IsmConfig mIsmCfg{};
+    /* Device sample rate, cached for image-source delay calculations. */
+    float mSampleRate{48000.0f};
+    /* Back-reference to the effect slot, used to read the aggregate wet
+     * source position accumulated by the mixing voices each update block.
+     */
+    const EffectSlotBase *mSlot{nullptr};
+
+    /* Per-block image-source inputs, cached by update() (which runs only when
+     * an effect parameter changes) and consumed by process() (which runs every
+     * update block). The source position itself changes without an effect
+     * property update, so the tap geometry must be regenerated in process().
+     */
+    float mIsmDensityMult{1.0f};
+    float mIsmAirLpPerSec{0.0f};
+    float mIsmReflectionsDelay{0.0f};
+    /* Main (device) mix params used to pan the directional B-Format taps. */
+    const MixParams *mIsmMainMix{nullptr};
 
 
     static constexpr auto DoMixRow(std::span<float> const OutBuffer,
@@ -728,6 +879,27 @@ struct ReverbState final : EffectState {
 
     void allocLines(float frequency);
 
+    /* Regenerates the image-source tap targets for the current aggregate
+     * source position and the reverb parameters cached by update(), smoothing
+     * the previous tap set toward them over the update block. Called every
+     * block from process() so the pattern tracks a moving source. No-op when
+     * the model is disabled or no mix parameters have been cached yet.
+     */
+    void updateImageSource(ReverbPipeline &pipeline);
+
+    /* Renders the image-source early reflections: feeds the (already gain-
+     * scaled) mono wet input into the variable-delay line and mixes each tap
+     * as a directionally panned B-Format signal into the pipeline's ISM
+     * output buffer, ready for the final output mix.
+     */
+    void processImageSource(ReverbPipeline &pipeline, std::size_t offset,
+        std::size_t samplesToDo) noexcept;
+    /* Mixes the rendered image-source B-Format output to the device buffers,
+     * applying the tap panning gains and the overall early output gain.
+     */
+    void mixImageSource(ReverbPipeline &pipeline, std::span<FloatBufferLine> samplesOut,
+        std::size_t samplesToDo) noexcept;
+
     void deviceUpdate(DeviceBase const *device, BufferStorage const *buffer) override;
     void update(ContextBase const *context, EffectSlotBase const *slot, EffectProps const *props,
         EffectTarget target) noexcept NONBLOCKING override;
@@ -741,6 +913,182 @@ struct ReverbState final : EffectState {
 
 auto CalcDelayLengthMult(float const density) -> float
 { return std::max(1.0f, std::cbrt(density*DensityScale)); }
+
+/* Loads the image-source model configuration from the [reverb] config block.
+ * Explicit room dimensions and per-axis wall reflection coefficients are
+ * optional; when absent the room is derived from the effect's Density and a
+ * single shared reflection coefficient is used.
+ */
+auto LoadIsmConfig() -> IsmConfig
+{
+    auto cfg = IsmConfig{};
+    cfg.mEnabled = ConfigValueBool({}, "reverb", "image-source").value_or(false);
+    if(!cfg.mEnabled)
+        return cfg;
+
+    if(auto v = ConfigValueU32({}, "reverb", "image-source-order"))
+        cfg.mOrder = std::clamp(*v, 1u, IsmMaxOrder);
+    if(auto v = ConfigValueF32({}, "reverb", "image-source-smoothing"))
+        cfg.mSmoothing = std::clamp(*v, 0.0f, 0.98f);
+
+    const auto w = ConfigValueF32({}, "reverb", "room-width");
+    const auto h = ConfigValueF32({}, "reverb", "room-height");
+    const auto d = ConfigValueF32({}, "reverb", "room-depth");
+    if(w && h && d)
+    {
+        cfg.mExplicitRoom = true;
+        cfg.mRoomSize = {
+            std::max(IsmMinRoomSize, *w),
+            std::max(IsmMinRoomSize, *h),
+            std::max(IsmMinRoomSize, *d),
+        };
+    }
+
+    const auto r = ConfigValueF32({}, "reverb", "wall-reflect");
+    if(r)
+    {
+        const auto coeff = std::clamp(*r, 0.0f, 1.0f);
+        cfg.mWallReflect = {coeff, coeff, coeff};
+    }
+    const auto rx = ConfigValueF32({}, "reverb", "wall-reflect-x");
+    const auto ry = ConfigValueF32({}, "reverb", "wall-reflect-y");
+    const auto rz = ConfigValueF32({}, "reverb", "wall-reflect-z");
+    if(rx) cfg.mWallReflect[0] = std::clamp(*rx, 0.0f, 1.0f);
+    if(ry) cfg.mWallReflect[1] = std::clamp(*ry, 0.0f, 1.0f);
+    if(rz) cfg.mWallReflect[2] = std::clamp(*rz, 0.0f, 1.0f);
+    return cfg;
+}
+
+/* Converts the EFX air-absorption high-frequency gain (a linear gain at the
+ * 5 kHz reference) into a one-pole low-pass coefficient applied over one
+ * second of propagation. Solves |H(f)|^2 = g^2 for the coefficient a:
+ *
+ *     a = (1-g) / (1+g) / (1 - 2g/(1+g) cos(2 pi f/fs))
+ *
+ * with f = 5 kHz. Returns 0 (no filtering) when the gain is at unity.
+ */
+auto CalcAirLpCoeff(float const airGainHF, float const frequency) -> float
+{
+    if(airGainHF >= 0.99999f)
+        return 0.0f;
+    const auto g = std::clamp(airGainHF, 1.0e-4f, 0.99999f);
+    const auto w = 2.0f*std::numbers::pi_v<float>*5000.0f/frequency;
+    const auto denom = (1.0f+g) - 2.0f*g*std::cos(w);
+    return std::clamp((1.0f-g)/denom, 0.0f, 1.0f);
+}
+
+/* Generates the shoebox image-source taps for a head-relative source
+ * position (listener at the origin). The room is centered on the listener, so
+ * its walls sit at +/- L_a/2 along each axis. Image coordinates follow the
+ * standard rectangular-room (Allen-Berkley) image-source relations. Per axis
+ * the room spans [0, L]; with the uncentered source s = S + L/2 and listener
+ * r = L/2, there are two image families for every integer p:
+ *
+ *     plus family:  img = 2 p L + s,  per-axis reflection order 2|p|
+ *     minus family: img = 2 p L - s,  per-axis order 2p-1 (p>=1), 1-2p (p<=0)
+ *
+ * The centered image coordinate is img - L/2. The minus family with p = 0 is
+ * the real (unreflected) source, which is excluded since only reflections are
+ * wanted. Each image contributes a delay d/c, a 1/d distance attenuation
+ * combined with the per-wall reflection product, and the head-relative arrival
+ * direction. Taps beyond ReverbMaxReflectionsDelay are dropped and the result
+ * is sorted by delay.
+ */
+void GenerateImageTaps(IsmConfig const &cfg, std::span<const float,3> const source,
+    std::span<IsmTap, IsmMaxTaps> taps, std::size_t &tapCount, float const baseDelay,
+    float const airLpPerSec)
+{
+    struct RawTap {
+        float Delay;
+        float Gain;
+        float LpCoeff;
+        std::array<float,3> Dir;
+    };
+    auto raw = std::array<RawTap, IsmMaxTaps>{};
+    auto count = 0_uz;
+
+    const auto order = static_cast<int>(cfg.mOrder);
+    /* Two image families per axis: plus (even reflection order) and minus
+     * (odd reflection order).
+     */
+    for(auto fx = 0; fx < 2; ++fx)
+    for(auto fy = 0; fy < 2; ++fy)
+    for(auto fz = 0; fz < 2; ++fz)
+    {
+        const auto family = std::array{fx, fy, fz};
+        for(auto px = -order; px <= order; ++px)
+        for(auto py = -order; py <= order; ++py)
+        for(auto pz = -order; pz <= order; ++pz)
+        {
+            const auto pidx = std::array{px, py, pz};
+
+            auto image = std::array<float,3>{};
+            auto wallGain = 1.0f;
+            auto reflOrder = 0u;
+            for(auto a = 0; a < 3; ++a)
+            {
+                const auto p = pidx[a];
+                const auto len = cfg.mRoomSize[a];
+                const auto s = source[a] + len*0.5f;
+                const auto pf = static_cast<float>(p);
+                int axisOrder;
+                if(family[a] == 0)
+                {
+                    /* Plus family: img = 2pL + s, reflection order 2|p|. */
+                    image[a] = 2.0f*pf*len + s - len*0.5f;
+                    axisOrder = 2*std::abs(p);
+                }
+                else
+                {
+                    /* Minus family: img = 2pL - s. The p = 0 and p = 1
+                     * images are the two first-order wall reflections; the
+                     * order grows by two for every further p step.
+                     */
+                    image[a] = 2.0f*pf*len - s - len*0.5f;
+                    axisOrder = (p >= 1) ? (2*p - 1) : (1 - 2*p);
+                }
+                reflOrder += static_cast<unsigned>(axisOrder);
+                wallGain *= std::pow(cfg.mWallReflect[a],
+                    static_cast<float>(axisOrder));
+            }
+
+            /* Reflection order zero is the real (direct) source path. */
+            if(reflOrder == 0u || reflOrder > cfg.mOrder)
+                continue;
+
+            const auto dx = image[0];
+            const auto dy = image[1];
+            const auto dz = image[2];
+            const auto path = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if(!(path > 1.0e-4f))
+                continue;
+
+            const auto delay = path/SpeedOfSound + baseDelay;
+            if(delay > ReverbMaxReflectionsDelay || count >= raw.size())
+                continue;
+
+            raw[count++] = RawTap{
+                delay,
+                wallGain/path,
+                /* One-pole coefficient for the total path time; the
+                 * per-second filter is exponentiated by travel time.
+                 */
+                1.0f - std::pow(1.0f - airLpPerSec, std::max(delay, 0.0f)),
+                {dx/path, dy/path, dz/path},
+            };
+        }
+    }
+
+    std::ranges::sort(raw | std::views::take(count), {}, &RawTap::Delay);
+    tapCount = count;
+    for(auto i = 0_uz; i < count; ++i)
+    {
+        taps[i].DelayTarget = raw[i].Delay;
+        taps[i].GainTarget = raw[i].Gain;
+        taps[i].LpCoeffTarget = raw[i].LpCoeff;
+        taps[i].DirTarget = raw[i].Dir;
+    }
+}
 
 /* Calculates the delay line metrics and allocates the shared sample buffer
  * for all lines given the sample rate (frequency).
@@ -764,7 +1112,7 @@ void ReverbState::allocLines(float const frequency)
     const auto late_vecap_extra = al::saturating_cast<unsigned>(
         std::ceil(LATE_ALLPASS_LENGTHS.front() * multiplier * frequency));
 
-    auto linelengths = std::array<std::size_t, 11>{};
+    auto linelengths = std::array<std::size_t, 13>{};
     auto oidx = 0_uz;
 
     auto totalSamples = 0_uz;
@@ -811,8 +1159,20 @@ void ReverbState::allocLines(float const frequency)
         count = pipeline.mLate.Delay.calcLineLength(length, frequency, 4);
         linelengths[oidx++] = count;
         totalSamples += count;
+
+        /* The image-source early-reflection delay line. It must hold the
+         * longest image path (bounded by ReverbMaxReflectionsDelay), plus two
+         * samples of headroom for the fractional-delay interpolation.
+         */
+        if(mIsmCfg.mEnabled)
+        {
+            length = ReverbMaxReflectionsDelay;
+            count = pipeline.mIsm.Delay.calcLineLength(length, frequency, 2);
+            linelengths[oidx++] = count;
+            totalSamples += count;
+        }
     }
-    Ensures(oidx == linelengths.size());
+    Ensures(oidx == (mIsmCfg.mEnabled ? linelengths.size() : 11_uz));
 
     if(totalSamples != mSampleBuffer.size())
         decltype(mSampleBuffer)(totalSamples).swap(mSampleBuffer);
@@ -835,13 +1195,24 @@ void ReverbState::allocLines(float const frequency)
         bufferspan = bufferspan.subspan(linelengths[oidx++]);
         pipeline.mLate.Delay.realizeLineOffset(bufferspan.first(linelengths[oidx]));
         bufferspan = bufferspan.subspan(linelengths[oidx++]);
+        if(mIsmCfg.mEnabled)
+        {
+            pipeline.mIsm.Delay.realizeLineOffset(bufferspan.first(linelengths[oidx]));
+            bufferspan = bufferspan.subspan(linelengths[oidx++]);
+        }
     }
-    Ensures(oidx == linelengths.size());
+    Ensures(oidx == (mIsmCfg.mEnabled ? linelengths.size() : 11_uz));
 }
 
 void ReverbState::deviceUpdate(DeviceBase const *device, BufferStorage const*)
 {
     const auto frequency = static_cast<float>(device->mSampleRate);
+    mSampleRate = frequency;
+
+    /* Load the optional image-source model configuration before allocating
+     * the delay lines, since the model adds its own per-pipeline line.
+     */
+    mIsmCfg = LoadIsmConfig();
 
     /* Allocate the delay lines. */
     allocLines(frequency);
@@ -869,6 +1240,235 @@ void ReverbState::deviceUpdate(DeviceBase const *device, BufferStorage const*)
         pipeline.mAmbiSplitter[0].fill(splitter);
         pipeline.mAmbiSplitter[1].fill(splitter);
     });
+}
+
+void ReverbState::updateImageSource(ReverbPipeline &pipeline)
+{
+    if(!mIsmCfg.mEnabled || mIsmMainMix == nullptr)
+        return;
+
+    auto &ism = pipeline.mIsm;
+    const auto density_mult = mIsmDensityMult;
+    const auto mainMix = mIsmMainMix;
+
+    /* Resolve the room geometry. Without explicit dimensions, derive an
+     * average side length from the Density room-size multiplier (anchored on
+     * the same 5 m average the legacy taps use).
+     */
+    auto roomSize = mIsmCfg.mRoomSize;
+    if(!mIsmCfg.mExplicitRoom)
+        roomSize = {
+            IsmBaseRoomSize*density_mult,
+            IsmBaseRoomSize*density_mult,
+            IsmBaseRoomSize*density_mult,
+        };
+    auto cfg = mIsmCfg;
+    cfg.mRoomSize = roomSize;
+
+    /* Consume the slot's energy-weighted aggregate source position. When no
+     * voice contributed this block, hold the last resolved position.
+     */
+    if(mSlot != nullptr && mSlot->mWetPosWeight > GainSilenceThreshold)
+    {
+        const auto inv = 1.0f/mSlot->mWetPosWeight;
+        ism.LastPos = {
+            mSlot->mWetPosAccum[0]*inv,
+            mSlot->mWetPosAccum[1]*inv,
+            mSlot->mWetPosAccum[2]*inv,
+        };
+        ism.HasPosition = true;
+    }
+
+    /* Keep the source inside the room (with a small margin) so image geometry
+     * stays well conditioned even if a source is placed beyond a wall.
+     */
+    auto source = ism.LastPos;
+    for(auto a = 0; a < 3; ++a)
+    {
+        const auto bound = roomSize[a]*0.5f - IsmMinRoomSize*0.1f;
+        source[a] = std::clamp(source[a], -bound, bound);
+    }
+
+    GenerateImageTaps(cfg, source, ism.Taps, ism.TapCount, mIsmReflectionsDelay,
+        mIsmAirLpPerSec);
+    if(!ism.HasPosition)
+    {
+        /* No source position yet: keep the generated tap geometry but leave
+         * the gains silent.
+         */
+        for(auto i = 0_uz; i < ism.TapCount; ++i)
+            ism.Taps[i].GainTarget = 0.0f;
+    }
+
+    /* Normalize tap gains so the total early energy is independent of room
+     * geometry and tap count. The slot's ReflectionsGain is applied to the
+     * whole early stage by the caller through the shared early output gain.
+     */
+    auto energy = 0.0f;
+    for(auto i = 0_uz; i < ism.TapCount; ++i)
+        energy += ism.Taps[i].GainTarget*ism.Taps[i].GainTarget;
+    if(energy > std::numeric_limits<float>::epsilon())
+    {
+        const auto norm = 1.0f/std::sqrt(energy);
+        for(auto i = 0_uz; i < ism.TapCount; ++i)
+            ism.Taps[i].GainTarget *= norm;
+    }
+
+    /* One-pole smoothing for tap delay/gain/filter/direction updates. On the
+     * first block with a real source position, snap the geometry (delay,
+     * filter coefficient, direction and panning) to its target so the opening
+     * impulse is rendered with the correct reflection timing; the gain still
+     * ramps up from zero to avoid a click.
+     */
+    const auto a = 1.0f - cfg.mSmoothing;
+    const auto snapGeometry = ism.HasPosition && !ism.GeometryInitialized;
+    for(auto i = 0_uz; i < ism.TapCount; ++i)
+    {
+        auto &tap = ism.Taps[i];
+        if(snapGeometry)
+        {
+            tap.Delay = tap.DelayTarget;
+            tap.LpCoeff = tap.LpCoeffTarget;
+            tap.Dir = tap.DirTarget;
+        }
+        else
+        {
+            tap.Delay = std::lerp(tap.Delay, tap.DelayTarget, a);
+            tap.LpCoeff = std::lerp(tap.LpCoeff, tap.LpCoeffTarget, a);
+            for(auto c = 0; c < 3; ++c)
+                tap.Dir[c] = std::lerp(tap.Dir[c], tap.DirTarget[c], a);
+        }
+        /* Gain always eases toward its target (from zero while silent), which
+         * also provides the fade-in when taps first become audible.
+         */
+        tap.Gain = std::lerp(tap.Gain, tap.GainTarget, a);
+
+        /* Compute output-channel panning gains for each first-order B-Format
+         * (ACN/N3D) component this tap produces. The tap's encoded signal is
+         * W plus the directional Y/Z/X components, so each component is mapped
+         * through the device's ambisonic channel map independently.
+         */
+        auto ambi = std::array<float, MaxAmbiChannels>{};
+        ambi[0] = 1.0f;                 /* ACN 0: W (omnidirectional) */
+        ComputePanGains(mainMix, ambi, tap.Gain, tap.Gains.Target[0]);
+        /* ACN 1..3: directional components in N3D, converted from the
+         * head-relative OpenAL arrival direction (negate X and Z).
+         */
+        const auto dirCoeff = std::array{-tap.Dir[0], tap.Dir[1], -tap.Dir[2]};
+        for(auto c = 0_uz; c < 3_uz; ++c)
+        {
+            ambi.fill(0.0f);
+            ambi[c+1] = dirCoeff[c];
+            ComputePanGains(mainMix, ambi, tap.Gain, tap.Gains.Target[c+1]);
+        }
+        if(snapGeometry)
+            tap.Gains.Current = tap.Gains.Target;
+    }
+    if(ism.HasPosition)
+        ism.GeometryInitialized = true;
+
+    /* Retire taps beyond the current count. */
+    for(auto i = ism.TapCount; i < IsmMaxTaps; ++i)
+        ism.Taps[i].Gains.fill(0.0f);
+}
+
+void ReverbState::processImageSource(ReverbPipeline &pipeline, std::size_t const offset,
+    std::size_t const samplesToDo) noexcept
+{
+    if(!mIsmCfg.mEnabled)
+        return;
+
+    auto &ism = pipeline.mIsm;
+    const auto line = ism.Delay.get(0);
+    const auto stride = line.size();
+
+    for(auto t = 0_uz; t < ism.TapCount; ++t)
+    {
+        auto &tap = ism.Taps[t];
+        /* Clear this tap's B-Format block. */
+        for(auto c = 0_uz; c < NUM_LINES; ++c)
+            std::ranges::fill(std::span{ism.TapBf[t][c]}.first(samplesToDo), 0.0f);
+        if(tap.Gain <= GainSilenceThreshold && tap.GainTarget <= GainSilenceThreshold)
+            continue;
+
+        /* Fractional delay (samples) with linear interpolation, bounded by the
+         * allocated line length.
+         */
+        const auto delaySamples = std::clamp(tap.Delay*mSampleRate, 1.0f,
+            static_cast<float>(stride-3));
+        const auto d0 = static_cast<std::size_t>(delaySamples);
+        const auto frac = delaySamples - static_cast<float>(d0);
+        const auto lpA = tap.LpCoeff;
+
+        auto gain = tap.Gain;
+        const auto gainStep = (tap.GainTarget - tap.Gain)
+            / static_cast<float>(samplesToDo);
+
+        auto lpState = tap.LpState;
+        for(auto i = 0_uz; i < samplesToDo; ++i)
+        {
+            const auto pos = (offset + i - d0) & (stride-1);
+            const auto s0 = line[pos];
+            const auto s1 = line[(pos+1) & (stride-1)];
+            /* Wall/air high-frequency loss as a one-pole low-pass. */
+            lpState = s0 + lpA*(lpState - s0);
+            const auto delayed = std::lerp(s0, s1, frac);
+            const auto wet = delayed*gain;
+            gain += gainStep;
+            /* First-order B-Format (N3D). ACN 0 = W (omni); the directional
+             * components negate OpenAL X and Z.
+             */
+            ism.TapBf[t][0][i] = wet;
+            ism.TapBf[t][1][i] = wet*(-tap.Dir[0]);
+            ism.TapBf[t][2][i] = wet*( tap.Dir[1]);
+            ism.TapBf[t][3][i] = wet*(-tap.Dir[2]);
+        }
+        tap.LpState = lpState;
+        tap.Gain = gain;
+    }
+}
+
+void ReverbState::mixImageSource(ReverbPipeline &pipeline,
+    std::span<FloatBufferLine> const samplesOut, std::size_t const samplesToDo) noexcept
+{
+    if(!mIsmCfg.mEnabled)
+        return;
+
+    auto &ism = pipeline.mIsm;
+    const auto outGain = pipeline.mIsmOutGain;
+    if(outGain <= GainSilenceThreshold)
+        return;
+
+    const auto nOut = std::min(samplesOut.size(), MaxAmbiChannels);
+    for(auto t = 0_uz; t < ism.TapCount; ++t)
+    {
+        auto &tap = ism.Taps[t];
+        if(tap.Gain <= GainSilenceThreshold && tap.GainTarget <= GainSilenceThreshold)
+            continue;
+
+        /* Interpolate each B-Format component's output panning gains over the
+         * block while mixing its rendered signal.
+         */
+        for(auto bf = 0_uz; bf < NUM_LINES; ++bf)
+        {
+            auto gains = tap.Gains.Current[bf];
+            auto steps = std::array<float, MaxAmbiChannels>{};
+            for(auto c = 0_uz; c < MaxAmbiChannels; ++c)
+                steps[c] = (tap.Gains.Target[bf][c] - tap.Gains.Current[bf][c])
+                    / static_cast<float>(samplesToDo);
+
+            for(auto i = 0_uz; i < samplesToDo; ++i)
+            {
+                const auto wet = ism.TapBf[t][bf][i]*outGain;
+                for(auto c = 0_uz; c < nOut; ++c)
+                {
+                    samplesOut[c][i] += wet*gains[c];
+                    gains[c] += steps[c];
+                }
+            }
+            tap.Gains.Current[bf] = gains;
+        }
+    }
 }
 
 /**************************************
@@ -1249,6 +1849,9 @@ void ReverbState::update(ContextBase const *const context, EffectSlotBase const 
     const auto &device = context->mDevice;
     const auto frequency = static_cast<float>(device.mSampleRate);
 
+    /* Keep the slot reference for per-block source-position queries. */
+    mSlot = slot;
+
     /* If the HF limit parameter is flagged, calculate an appropriate limit
      * based on the air absorption parameter.
      */
@@ -1310,12 +1913,31 @@ void ReverbState::update(ContextBase const *const context, EffectSlotBase const 
     pipeline.updateDelayLine(reverbprops.Gain, reverbprops.ReflectionsDelay,
         reverbprops.LateReverbDelay, density_mult, frequency);
 
-    /* Update early and late 3D panning. */
+    /* Update early and late 3D panning. When the image-source model is active
+     * it replaces the legacy fixed-tap early output, so the legacy early
+     * panning gains are muted (the legacy early stage still feeds the late
+     * reverb input through its scatter path, preserving the tail response).
+     */
     mOutTarget = target.Main->Buffer;
     const auto gain = slot->Gain * ReverbBoost;
+    const auto earlyGain = mIsmCfg.mEnabled ? 0.0f : reverbprops.ReflectionsGain*gain;
     pipeline.update3DPanning(reverbprops.ReflectionsPan, reverbprops.LateReverbPan,
-        reverbprops.ReflectionsGain*gain, reverbprops.LateReverbGain*gain, mUpmixOutput,
-        target.Main);
+        earlyGain, reverbprops.LateReverbGain*gain, mUpmixOutput, target.Main);
+
+    /* Cache the position-aware image-source inputs. The tap geometry itself is
+     * regenerated every update block in process(), because the source position
+     * moves without an effect property change; update() only runs when an
+     * effect parameter changes. The reflection gain is applied to the ISM
+     * output separately so it matches the legacy early level when enabled.
+     */
+    if(mIsmCfg.mEnabled)
+    {
+        pipeline.mIsmOutGain = reverbprops.ReflectionsGain*gain;
+        mIsmDensityMult = density_mult;
+        mIsmAirLpPerSec = CalcAirLpCoeff(reverbprops.AirAbsorptionGainHF, frequency);
+        mIsmReflectionsDelay = reverbprops.ReflectionsDelay;
+        mIsmMainMix = target.Main;
+    }
 
     /* Calculate the master filters */
     auto const hf0norm = std::min(reverbprops.HFReference/frequency, 0.49f);
@@ -1371,6 +1993,7 @@ void ReverbState::update(ContextBase const *const context, EffectSlotBase const 
      * excessive double-processing.
      */
     pipeline.mFadeSampleCount = static_cast<std::size_t>(std::min(decaySamples, 100'000.0f));
+    mFadeSampleTotal = std::max(pipeline.mFadeSampleCount, std::size_t{1});
 }
 
 
@@ -1845,6 +2468,17 @@ void ReverbState::process(std::size_t const samplesToDo,
     auto &oldpipeline = mPipelines[!mCurrentPipeline];
     auto &pipeline = mPipelines[mCurrentPipeline];
 
+    /* Regenerate the position-aware image taps every update block. This runs
+     * here rather than in update() because source/listener movement updates the
+     * voice parameters without an effect property change, and the reflection
+     * pattern must track that movement in real time. The active pipeline is
+     * refreshed before its delay line is read below. During a cross-fade the
+     * old pipeline keeps the tap geometry it faded in with and only ramps out.
+     */
+    if(mIsmCfg.mEnabled && (mPipelineState == Normal || mPipelineState == DeviceClear
+        || mPipelineState == StartFade))
+        updateImageSource(pipeline);
+
     /* Convert B-Format to A-Format for processing. */
     const auto numInput = std::min(samplesIn.size(), NUM_LINES);
     for(const auto c : std::views::iota(0_uz, NUM_LINES))
@@ -1861,11 +2495,29 @@ void ReverbState::process(std::size_t const samplesToDo,
         mMainDelay.write(offset, c, tmpspan);
     }
 
+    /* Feed the image-source delay lines with the omnidirectional (W) wet
+     * input, which is the B-Format W (ACN 0) channel of the slot's wet
+     * buffer. Both pipelines are fed so a cross-fade keeps the position-aware
+     * response continuous across parameter changes.
+     */
+    if(mIsmCfg.mEnabled && !samplesIn.empty())
+    {
+        const auto wIn = std::span{samplesIn[0]}.first(samplesToDo);
+        pipeline.mIsm.Delay.write(offset, 0, wIn);
+        if(mPipelineState != Normal)
+            oldpipeline.mIsm.Delay.write(offset, 0, wIn);
+    }
+
     mPipelineState = std::max(Fading, mPipelineState);
 
     /* Process reverb for these samples. and mix them to the output. */
     pipeline.processEarly(mMainDelay, offset, samplesToDo, mTempSamples, mEarlySamples);
     pipeline.processLate(offset, samplesToDo, mTempSamples, mLateSamples);
+    if(mIsmCfg.mEnabled)
+    {
+        processImageSource(pipeline, offset, samplesToDo);
+        mixImageSource(pipeline, samplesOut, samplesToDo);
+    }
     mixOut(pipeline, samplesOut, samplesToDo);
 
     if(mPipelineState != Normal)
@@ -1899,6 +2551,21 @@ void ReverbState::process(std::size_t const samplesToDo,
             /* Process the old reverb for these samples. */
             oldpipeline.processEarly(mMainDelay, offset, samplesToDo, mTempSamples, mEarlySamples);
             oldpipeline.processLate(offset, samplesToDo, mTempSamples, mLateSamples);
+            if(mIsmCfg.mEnabled)
+            {
+                /* Fade the old pipeline's image-source output out alongside
+                 * its legacy early/late gains. Its tap gains stay fixed while
+                 * the overall ISM output gain ramps to zero over the fade.
+                 */
+                const auto fadeGain = oldpipeline.mIsmOutGain
+                    * (static_cast<float>(oldpipeline.mFadeSampleCount)
+                       / static_cast<float>(mFadeSampleTotal));
+                processImageSource(oldpipeline, offset, samplesToDo);
+                const auto saved = oldpipeline.mIsmOutGain;
+                oldpipeline.mIsmOutGain = fadeGain;
+                mixImageSource(oldpipeline, samplesOut, samplesToDo);
+                oldpipeline.mIsmOutGain = saved;
+            }
             mixOut(oldpipeline, samplesOut, samplesToDo);
         }
     }

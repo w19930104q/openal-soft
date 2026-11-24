@@ -78,6 +78,18 @@ struct EffectSlotBase {
     /* Mixing buffer used by the Wet mix. */
     al::vector<FloatBufferLine,16> mWetBuffer;
 
+    /* Energy-weighted aggregate of the head-relative source positions of all
+     * voices mixing into this slot for the current update block. Voices add
+     * their send-gain-weighted position while mixing; the mixer clears the
+     * accumulators before each update. Position-aware effects (image-source
+     * reverb early reflections) consume mWetPosAccum/mWetPosWeight; when the
+     * weight is zero (no contributing voice) the previous position is held.
+     * Mutable because effects receive the slot as const but need to read this
+     * mixer-thread scratch state.
+     */
+    mutable std::array<float,3> mWetPosAccum{};
+    mutable float mWetPosWeight{0.0f};
+
     [[nodiscard]] static
     auto CreatePtrArray(size_t count) -> std::unique_ptr<EffectSlotArray>;
 };

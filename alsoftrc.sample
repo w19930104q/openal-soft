@@ -412,6 +412,42 @@
 #  value of 0 means no change.
 #boost = 0
 
+## image-source: (global)
+#  Enables the image-source method (ISM) for the reverb effect's early
+#  reflections. Instead of the legacy fixed set of reflection taps, the early
+#  reflections are computed from a shoebox room model, with each tap's delay,
+#  gain and arrival direction derived from the room dimensions and the live
+#  source/listener positions. The pattern therefore updates every mix block and
+#  tracks a moving source in real time. The late reverb tail is unchanged.
+#image-source = false
+
+## image-source-order: (global)
+#  Maximum image reflection order when image-source is enabled. 1 includes the
+#  six first-order (single-wall) reflections; 2 additionally includes up to 18
+#  second-order edge/corner reflections (24 taps total).
+#image-source-order = 1
+
+## image-source-smoothing: (global)
+#  One-pole smoothing factor (0..0.98) applied per mix block to the image taps'
+#  delay, gain, filter and direction updates. Higher values smooth parameter
+#  changes more strongly, reducing zipper noise as sources move at the cost of
+#  a slower response.
+#image-source-smoothing = 0.5
+
+## room-width, room-height, room-depth: (global)
+#  Shoebox room side lengths in meters for the image-source model (width=X,
+#  height=Y, depth=Z), centered on the listener. If unset, the room size is
+#  derived from AL_REVERB_DENSITY. Values are clamped to a small minimum.
+#room-width = 8.0
+#room-height = 6.0
+#room-depth = 3.0
+
+## wall-reflect, wall-reflect-x/y/z: (global)
+#  Wall reflection coefficient (0 = fully anechoic, 1 = perfect reflector) used
+#  for the image-source gain model. The single wall-reflect value applies to
+#  every axis; the per-axis variants override it individually.
+#wall-reflect = 0.9
+
 ##
 ## PipeWire backend stuff
 ##

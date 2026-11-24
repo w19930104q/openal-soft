@@ -1797,6 +1797,11 @@ void CalcAttnVoiceParams(Voice *const voice, ContextBase const *const context) n
         velocity += context->mParams.Velocity;
     }
 
+    /* Store the head-relative source position (pre-normalization) for
+     * position-aware effects fed through the wet sends.
+     */
+    voice->mWetPos = {position[0], position[1], position[2]};
+
     auto tosource = al::Vector{position[0], position[1], position[2], 0.0f};
     auto const distance = tosource.normalize();
     auto const directional = bool{direction.normalize() > 0.0f};
@@ -2236,6 +2241,16 @@ void ProcessContexts(DeviceBase const *const device, unsigned const SamplesToDo)
         std::ranges::fill(auxslots | std::views::transform(&EffectSlotBase::Wet)
             | std::views::transform(&MixParams::Buffer) | std::views::join | std::views::join,
             0.0f);
+
+        /* Clear the per-slot wet source-position accumulators. Voices refill
+         * these while mixing so position-aware effects can locate the
+         * contributing sources within the current block.
+         */
+        std::ranges::for_each(auxslots, [](EffectSlotBase *slot)
+        {
+            slot->mWetPosAccum.fill(0.0f);
+            slot->mWetPosWeight = 0.0f;
+        });
 
         /* Process voices that have a playing source. */
         std::ranges::for_each(voices, [ctx,curtime,SamplesToDo](Voice *voice)
