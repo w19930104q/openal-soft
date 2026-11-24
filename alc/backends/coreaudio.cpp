@@ -96,29 +96,146 @@ constexpr std::array<AudioChannelLabel, 6> X51ChanMap {
 constexpr std::array<AudioChannelLabel, 6> X51RearChanMap {
         kAudioChannelLabel_Left, kAudioChannelLabel_Right,
         kAudioChannelLabel_Center, kAudioChannelLabel_LFEScreen,
-        kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_RearSurroundLeft
+        kAudioChannelLabel_RearSurroundLeft, kAudioChannelLabel_RearSurroundRight
 };
 constexpr std::array<AudioChannelLabel, 7> X61ChanMap {
         kAudioChannelLabel_Left, kAudioChannelLabel_Right,
         kAudioChannelLabel_Center, kAudioChannelLabel_LFEScreen,
-        kAudioChannelLabel_CenterSurround,
-        kAudioChannelLabel_RearSurroundRight, kAudioChannelLabel_RearSurroundLeft
+        kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround,
+        kAudioChannelLabel_CenterSurround
 };
 constexpr std::array<AudioChannelLabel, 8> X71ChanMap {
         kAudioChannelLabel_Left, kAudioChannelLabel_Right,
         kAudioChannelLabel_Center, kAudioChannelLabel_LFEScreen,
         kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround,
-        kAudioChannelLabel_LeftCenter, kAudioChannelLabel_RightCenter
+        kAudioChannelLabel_RearSurroundLeft, kAudioChannelLabel_RearSurroundRight
 };
 constexpr std::array<AudioChannelLabel, 12> X714ChanMap {
         kAudioChannelLabel_Left, kAudioChannelLabel_Right, kAudioChannelLabel_Center, kAudioChannelLabel_LFEScreen,
     kAudioChannelLabel_LeftSurround, kAudioChannelLabel_RightSurround,
-    kAudioChannelLabel_LeftSideSurround,
-    kAudioChannelLabel_RightSideSurround,
-    kAudioChannelLabel_LeftTopFront,
-    kAudioChannelLabel_RightTopFront,
+    kAudioChannelLabel_LeftTopFront, kAudioChannelLabel_RightTopFront,
+    kAudioChannelLabel_RearSurroundLeft, kAudioChannelLabel_RearSurroundRight,
     kAudioChannelLabel_LeftTopRear, kAudioChannelLabel_RightTopRear
 };
+
+struct ChannelMap {
+    DevFmtChannels fmt;
+    std::span<const AudioChannelLabel> map;
+};
+
+constexpr std::array<ChannelMap, 8> chanmaps{{
+    { DevFmtX714, X714ChanMap },
+    { DevFmtX71, X71ChanMap },
+    { DevFmtX61, X61ChanMap },
+    { DevFmtX51, X51ChanMap },
+    { DevFmtX51, X51RearChanMap },
+    { DevFmtQuad, QuadChanMap },
+    { DevFmtStereo, StereoChanMap },
+    { DevFmtMono, MonoChanMap }
+}};
+
+
+/* Converts a CoreAudio channel label to the OpenAL logical channel it feeds
+ * for the given output format. Surround labels are ambiguous: whether they
+ * feed a "side" or "back" OpenAL channel depends on the speaker set the
+ * format's panning decoder actually renders. Returns NumChannels for labels
+ * OpenAL has no output slot for.
+ */
+constexpr auto LabelToChannel(AudioChannelLabel label, DevFmtChannels fmt) noexcept -> Channel
+{
+    switch(label)
+    {
+    case kAudioChannelLabel_Left:                 return FrontLeft;
+    case kAudioChannelLabel_Right:                return FrontRight;
+    case kAudioChannelLabel_Center:               return FrontCenter;
+    case kAudioChannelLabel_LFEScreen:            return LFE;
+    case kAudioChannelLabel_Mono:                 return FrontCenter;
+
+    case kAudioChannelLabel_LeftSurround:
+    case kAudioChannelLabel_LeftSurroundDirect:
+        /* Quad renders to back speakers; every other multichannel format uses
+         * these labels for its side speakers.
+         */
+        return (fmt == DevFmtQuad) ? BackLeft : SideLeft;
+    case kAudioChannelLabel_RightSurround:
+    case kAudioChannelLabel_RightSurroundDirect:
+        return (fmt == DevFmtQuad) ? BackRight : SideRight;
+
+    case kAudioChannelLabel_RearSurroundLeft:
+        /* 5.1/6.1 have no separate back pair, so a rear speaker plays the
+         * surround (side) channel. 7.1 renders distinct back channels.
+         */
+        return (fmt == DevFmtX71 || fmt == DevFmtX714) ? BackLeft : SideLeft;
+    case kAudioChannelLabel_RearSurroundRight:
+        return (fmt == DevFmtX71 || fmt == DevFmtX714) ? BackRight : SideRight;
+
+    case kAudioChannelLabel_CenterSurround:
+    case kAudioChannelLabel_CenterSurroundDirect: return BackCenter;
+    case kAudioChannelLabel_LeftTopFront:         return TopFrontLeft;
+    case kAudioChannelLabel_RightTopFront:        return TopFrontRight;
+    case kAudioChannelLabel_LeftTopRear:          return TopBackLeft;
+    case kAudioChannelLabel_RightTopRear:         return TopBackRight;
+    }
+    return NumChannels;
+}
+
+/* Finds the OpenAL channel configuration whose speaker set is covered by the
+ * given (unsorted) CoreAudio channel labels. The labels may be reported in any
+ * order, and may include extra labels for speakers OpenAL doesn't render.
+ */
+template<std::size_t N>
+constexpr auto MatchChannelFormat(const std::array<AudioChannelLabel,N> &labels) noexcept
+    -> std::optional<DevFmtChannels>
+{
+    auto sorted = labels;
+    std::ranges::sort(sorted);
+    for(const ChannelMap &chanmap : chanmaps)
+    {
+        if(std::ranges::includes(sorted, chanmap.map))
+            return chanmap.fmt;
+    }
+    return std::nullopt;
+}
+
+constexpr auto MatchChannelFormat(std::span<const AudioChannelLabel> labels) noexcept
+    -> std::optional<DevFmtChannels>
+{
+    if(labels.empty()) return std::nullopt;
+    auto sorted = std::vector<AudioChannelLabel>(labels.begin(), labels.end());
+    std::ranges::sort(sorted);
+    for(const ChannelMap &chanmap : chanmaps)
+    {
+        if(std::ranges::includes(sorted, chanmap.map))
+            return chanmap.fmt;
+    }
+    return std::nullopt;
+}
+
+/* Builds a map of OpenAL logical channel -> device stream position from the
+ * CoreAudio channel labels, which are given in the order the device expects
+ * its interleaved frames. Only usable when the device exposes exactly as many
+ * recognizable labels as the stream has channels; returns std::nullopt
+ * otherwise so the caller can keep the default WFX order.
+ */
+constexpr auto MakeChannelOrder(std::span<const AudioChannelLabel> devLabels,
+    unsigned numchans, DevFmtChannels fmt) noexcept
+    -> std::optional<std::array<std::uint8_t, NumChannels>>
+{
+    if(devLabels.size() != numchans)
+        return std::nullopt;
+
+    auto order = std::array<std::uint8_t, NumChannels>{};
+    order.fill(InvalidChannelIndex);
+
+    for(unsigned i{0};i < numchans;++i)
+    {
+        const Channel ch{LabelToChannel(devLabels[i], fmt)};
+        if(ch == NumChannels || order[ch] != InvalidChannelIndex)
+            return std::nullopt;
+        order[ch] = gsl::narrow_cast<std::uint8_t>(i);
+    }
+    return order;
+}
 
 struct FourCCPrinter {
     char mString[sizeof(UInt32) + 1]{};
@@ -380,6 +497,137 @@ static constexpr char ca_device[] = "CoreAudio Default";
 #endif
 
 
+/* Extracts the ordered channel labels from a CoreAudio channel layout.
+ * Description-based layouts keep the stream order of the descriptions; bitmap
+ * layouts are expanded in bit order, which is the stream order CoreAudio uses
+ * for bitmap layouts; tag-based layouts are expanded through AudioFormat.
+ */
+auto GetLayoutLabels(AudioChannelLayoutTag layoutTag, AudioChannelBitmap bitmap,
+    std::span<const AudioChannelDescription> descs) -> std::vector<AudioChannelLabel>
+{
+    auto labels = std::vector<AudioChannelLabel>{};
+
+    if(layoutTag == kAudioChannelLayoutTag_UseChannelDescriptions)
+    {
+        labels.reserve(descs.size());
+        std::ranges::transform(descs, std::back_inserter(labels),
+            &AudioChannelDescription::mChannelLabel);
+        return labels;
+    }
+
+    if(layoutTag == kAudioChannelLayoutTag_UseChannelBitmap)
+    {
+        struct BitmapEntry { AudioChannelBitmap bit; AudioChannelLabel label; };
+        static constexpr std::array<BitmapEntry, 18> bitmapMap{{
+            { kAudioChannelBit_Left,                 kAudioChannelLabel_Left },
+            { kAudioChannelBit_Right,                kAudioChannelLabel_Right },
+            { kAudioChannelBit_Center,               kAudioChannelLabel_Center },
+            { kAudioChannelBit_LFEScreen,            kAudioChannelLabel_LFEScreen },
+            { kAudioChannelBit_LeftSurround,         kAudioChannelLabel_LeftSurround },
+            { kAudioChannelBit_RightSurround,        kAudioChannelLabel_RightSurround },
+            { kAudioChannelBit_LeftCenter,           kAudioChannelLabel_LeftCenter },
+            { kAudioChannelBit_RightCenter,          kAudioChannelLabel_RightCenter },
+            { kAudioChannelBit_CenterSurround,       kAudioChannelLabel_CenterSurround },
+            { kAudioChannelBit_TopCenterSurround,    kAudioChannelLabel_TopCenterSurround },
+            { kAudioChannelBit_VerticalHeightLeft,   kAudioChannelLabel_LeftTopFront },
+            { kAudioChannelBit_VerticalHeightCenter, kAudioChannelLabel_CenterTopFront },
+            { kAudioChannelBit_VerticalHeightRight,  kAudioChannelLabel_RightTopFront },
+            { kAudioChannelBit_TopBackLeft,          kAudioChannelLabel_LeftTopRear },
+            { kAudioChannelBit_TopBackCenter,        kAudioChannelLabel_CenterTopRear },
+            { kAudioChannelBit_TopBackRight,         kAudioChannelLabel_RightTopRear },
+            { kAudioChannelBit_RearSurroundLeft,     kAudioChannelLabel_RearSurroundLeft },
+            { kAudioChannelBit_RearSurroundRight,    kAudioChannelLabel_RearSurroundRight }
+        }};
+        for(const BitmapEntry &entry : bitmapMap)
+        {
+            if((bitmap & entry.bit) != 0)
+                labels.emplace_back(entry.label);
+        }
+        return labels;
+    }
+
+    /* A fixed tag names an ordered speaker set. Ask AudioFormat to expand it
+     * into channel descriptions so the same code path handles every layout.
+     */
+    auto propSize = UInt32{};
+    OSStatus err{AudioFormatGetPropertyInfo(kAudioFormatProperty_ChannelLayoutForTag,
+        sizeof(layoutTag), &layoutTag, &propSize)};
+    if(err != noErr || propSize < sizeof(AudioChannelLayout))
+    {
+        WARN("Failed to get channel layout info for tag {:#010x}: '{}' ({})",
+            static_cast<UInt32>(layoutTag), FourCCPrinter{err}.c_str(), err);
+        return labels;
+    }
+
+    auto layout_data = std::make_unique<char[]>(propSize);
+    /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
+    auto *tagLayout = reinterpret_cast<AudioChannelLayout*>(layout_data.get());
+    err = AudioFormatGetProperty(kAudioFormatProperty_ChannelLayoutForTag, sizeof(layoutTag),
+        &layoutTag, &propSize, tagLayout);
+    if(err != noErr)
+    {
+        WARN("Failed to get channel layout for tag {:#010x}: '{}' ({})",
+            static_cast<UInt32>(layoutTag), FourCCPrinter{err}.c_str(), err);
+        return labels;
+    }
+
+    const auto tagDescs = std::span{std::data(tagLayout->mChannelDescriptions),
+        tagLayout->mNumberChannelDescriptions};
+    labels.reserve(tagDescs.size());
+    std::ranges::transform(tagDescs, std::back_inserter(labels),
+        &AudioChannelDescription::mChannelLabel);
+    return labels;
+}
+
+auto GetLayoutLabels(const AudioChannelLayout &layout) -> std::vector<AudioChannelLabel>
+{
+    const auto descs = std::span{std::data(layout.mChannelDescriptions),
+        layout.mNumberChannelDescriptions};
+    return GetLayoutLabels(layout.mChannelLayoutTag, layout.mChannelBitmap, descs);
+}
+
+/* Queries the output AudioUnit's current channel layout, returning the labels
+ * in the device's stream order. Returns an empty vector when the device
+ * doesn't expose a usable layout.
+ */
+auto GetAudioUnitChannelLabels(AudioUnit audioUnit) -> std::vector<AudioChannelLabel>
+{
+    auto propSize = UInt32{};
+    auto writable = Boolean{};
+    OSStatus err{AudioUnitGetPropertyInfo(audioUnit, kAudioUnitProperty_AudioChannelLayout,
+        kAudioUnitScope_Output, OutputElement, &propSize, &writable)};
+    if(err != noErr || propSize < sizeof(AudioChannelLayout))
+    {
+        WARN("Failed to get audio channel layout info: '{}' ({})",
+            FourCCPrinter{err}.c_str(), err);
+        return {};
+    }
+
+    auto layout_data = std::make_unique<char[]>(propSize);
+    /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
+    auto *layout = reinterpret_cast<AudioChannelLayout*>(layout_data.get());
+    err = AudioUnitGetProperty(audioUnit, kAudioUnitProperty_AudioChannelLayout,
+        kAudioUnitScope_Output, OutputElement, layout, &propSize);
+    if(err != noErr)
+    {
+        WARN("Failed to get audio channel layout: '{}' ({})", FourCCPrinter{err}.c_str(),
+            err);
+        return {};
+    }
+
+    auto labels = GetLayoutLabels(*layout);
+    std::erase_if(labels, [](const AudioChannelLabel label) noexcept
+    {
+        /* Unknown/unused/coordinate-based slots can't be matched to an OpenAL
+         * speaker; drop them so they don't poison the format match.
+         */
+        return label == kAudioChannelLabel_Unknown || label == kAudioChannelLabel_Unused
+            || label == kAudioChannelLabel_UseCoordinates;
+    });
+    return labels;
+}
+
+
 struct CoreAudioPlayback final : BackendBase {
     using BackendBase::BackendBase;
     ~CoreAudioPlayback() override;
@@ -553,60 +801,24 @@ bool CoreAudioPlayback::reset()
         mDevice.mSampleRate = gsl::narrow_cast<unsigned>(streamFormat.mSampleRate);
     }
 
-    struct ChannelMap {
-        DevFmtChannels fmt;
-        std::span<const AudioChannelLabel> map;
-        bool is_51rear;
-    };
-
-    static constexpr std::array<ChannelMap, 8> chanmaps{{
-        { DevFmtX714, X714ChanMap, false },
-        { DevFmtX71, X71ChanMap, false },
-        { DevFmtX61, X61ChanMap, false },
-        { DevFmtX51, X51ChanMap, false },
-        { DevFmtX51, X51RearChanMap, true },
-        { DevFmtQuad, QuadChanMap, false },
-        { DevFmtStereo, StereoChanMap, false },
-        { DevFmtMono, MonoChanMap, false }
-    }};
+    /* Get the device's actual channel layout. The labels are kept in the
+     * device's stream order so they can both select the OpenAL channel
+     * configuration and remap the mixer output to the physical speakers.
+     */
+    const auto devLabels = GetAudioUnitChannelLabels(mAudioUnit);
 
     if(!mDevice.mFlags.test(DeviceFlag::ChannelsRequest))
     {
-        auto propSize = UInt32{};
-        auto writable = Boolean{};
-
-        err = AudioUnitGetPropertyInfo(mAudioUnit, kAudioUnitProperty_AudioChannelLayout,
-            kAudioUnitScope_Output, OutputElement, &propSize, &writable);
-        if(err == noErr)
+        if(const auto fmt = MatchChannelFormat(std::span{devLabels}))
         {
-            auto layout_data = std::make_unique<char[]>(propSize);
-            /* NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) */
-            auto *layout = reinterpret_cast<AudioChannelLayout*>(layout_data.get());
-
-            err = AudioUnitGetProperty(mAudioUnit, kAudioUnitProperty_AudioChannelLayout,
-                kAudioUnitScope_Output, OutputElement, layout, &propSize);
-            if(err == noErr)
-            {
-                auto descs = std::span{std::data(layout->mChannelDescriptions),
-                    layout->mNumberChannelDescriptions};
-                auto labels = std::vector<AudioChannelLayoutTag>(descs.size());
-
-                std::ranges::transform(descs, labels.begin(),
-                    &AudioChannelDescription::mChannelLabel);
-                std::ranges::sort(labels);
-
-                auto check_labels = [&labels](const ChannelMap &chanmap) -> bool
-                { return std::ranges::includes(labels, chanmap.map); };
-                auto chaniter = std::ranges::find_if(chanmaps, check_labels);
-                if(chaniter != chanmaps.end())
-                    mDevice.FmtChans = chaniter->fmt;
-            }
+            TRACE("Matched device channel layout to {}", DevFmtChannelsString(*fmt));
+            mDevice.FmtChans = *fmt;
         }
+        else if(!devLabels.empty())
+            WARN("Failed to find a matching channel configuration for {} device channels",
+                devLabels.size());
     }
 
-    /* TODO: Also set kAudioUnitProperty_AudioChannelLayout according to the AL
-     * device's channel configuration.
-     */
     streamFormat.mChannelsPerFrame = mDevice.channelsFromFmt();
 
     streamFormat.mFramesPerPacket = 1;
@@ -652,7 +864,21 @@ bool CoreAudioPlayback::reset()
         return false;
     }
 
-    setDefaultWFXChannelOrder();
+    /* Set the channel order according to the device's actual layout, so each
+     * OpenAL speaker is rendered to the matching physical output. If the
+     * device layout can't be used (unknown labels, or not enough channels),
+     * fall back to the default WFX channel order.
+     */
+    const auto numchans = mDevice.channelsFromFmt();
+    if(const auto order = MakeChannelOrder(std::span{devLabels}, numchans, mDevice.FmtChans))
+        mDevice.RealOut.ChannelIndex = *order;
+    else
+    {
+        if(!devLabels.empty())
+            WARN("Unable to remap {} channels to the device layout, using the default channel order",
+                numchans);
+        setDefaultWFXChannelOrder();
+    }
 
     /* setup callback */
     mFrameSize = mDevice.frameSizeFromFmt();
